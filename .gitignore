@@ -15,4 +15,5 @@ __pycache__/
 
 # Runtime state
 .memory/
+.state/
 *.log
