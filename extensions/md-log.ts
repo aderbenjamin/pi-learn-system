@@ -18,18 +18,53 @@
  * explanation (the user reads this file live).
  *
  * Commands:
- *   /md-log <filepath>  — Link a markdown file and backfill the session.
- *   /md-unlog           — Stop logging.
+ *   /learn <topic> | <subtopic> — Create and link a structured lesson, then start teaching.
+ *   /md-log <filepath>          — Link a markdown file and backfill the session.
+ *   /md-unlog                   — Stop logging.
  *
  * Append-only. No send-back-to-agent functionality (that lived in the old
- * .md-link extension this was modeled on).
+ * .md-link extension this was modeled on), except `/learn`, which sends the
+ * initial teaching request after the new lesson file has been linked.
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
 const QA_TOOLS = new Set(["quiz", "ask_user_question"]);
+
+function slugify(value: string): string {
+	return value
+		.normalize("NFKD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "")
+		.slice(0, 80)
+		.replace(/-+$/g, "");
+}
+
+function localDate(date = new Date()): string {
+	const year = date.getFullYear();
+	const month = String(date.getMonth() + 1).padStart(2, "0");
+	const day = String(date.getDate()).padStart(2, "0");
+	return `${year}-${month}-${day}`;
+}
+
+function parseLearnArgs(raw: string): { topic: string; subtopic: string } {
+	const trimmed = raw.trim();
+	if (!trimmed) return { topic: "", subtopic: "" };
+	if (trimmed.includes("|")) {
+		const [topic, ...rest] = trimmed.split("|");
+		return { topic: topic.trim(), subtopic: rest.join("|").trim() };
+	}
+	const [topic, ...rest] = trimmed.split(/\s+/);
+	return { topic: topic || "", subtopic: rest.join(" ").trim() };
+}
+
+function yamlString(value: string): string {
+	return JSON.stringify(value);
+}
 
 export default function mdLog(pi: ExtensionAPI) {
 	let logFile: string | null = null;
@@ -38,19 +73,13 @@ export default function mdLog(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		let lastLinkData: { file: string | null } | undefined;
-		for (const entry of ctx.sessionManager.getEntries()) {
+		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === "md-log") {
 				lastLinkData = entry.data as { file: string | null } | undefined;
 			}
 		}
-		if (lastLinkData?.file) {
-			logFile = lastLinkData.file;
-			const theme = ctx.ui.theme;
-			ctx.ui.setStatus(
-				"md-log",
-				theme.fg("accent", "🗒 ") + theme.fg("dim", path.basename(logFile)),
-			);
-		}
+		logFile = lastLinkData?.file ?? null;
+		setLogStatus(ctx, logFile);
 	});
 
 	// --- Serialization: events can fire close together; keep appends ordered ---
@@ -77,6 +106,27 @@ export default function mdLog(pi: ExtensionAPI) {
 		} catch {
 			// File may have been deleted externally; ignore.
 		}
+	}
+
+	function setLogStatus(ctx: any, file: string | null): void {
+		if (!ctx.hasUI) return;
+		if (!file) {
+			ctx.ui.setStatus("md-log", undefined);
+			return;
+		}
+		const theme = ctx.ui.theme;
+		ctx.ui.setStatus(
+			"md-log",
+			theme.fg("accent", "🗒 ") + theme.fg("dim", path.basename(file)),
+		);
+	}
+
+	function linkLogFile(resolved: string, ctx: any): { messageCount: number; wrote: boolean } {
+		logFile = resolved;
+		pi.appendEntry("md-log", { file: resolved });
+		const result = backfill(ctx);
+		setLogStatus(ctx, resolved);
+		return result;
 	}
 
 	// --- Formatting ---
@@ -278,6 +328,93 @@ export default function mdLog(pi: ExtensionAPI) {
 
 	// --- Commands ---
 
+	pi.registerCommand("learn", {
+		description: "Create, link, and start a structured teaching session",
+		getArgumentCompletions: () => null,
+		handler: async (args, ctx: any) => {
+			if (!ctx.hasUI) return;
+			if (typeof ctx.waitForIdle === "function") await ctx.waitForIdle();
+
+			let { topic, subtopic } = parseLearnArgs(args);
+			if (!topic) {
+				const answer = await ctx.ui.input("Broad topic", "e.g. SQL or linear algebra");
+				if (answer === undefined) return;
+				topic = answer.trim();
+			}
+			if (!subtopic) {
+				const answer = await ctx.ui.input("Lesson subtopic", "e.g. joins or eigenvectors");
+				if (answer === undefined) return;
+				subtopic = answer.trim() || topic;
+			}
+
+			const topicId = slugify(topic);
+			const subtopicId = slugify(subtopic);
+			if (!topicId || !subtopicId) {
+				ctx.ui.notify("Topic and subtopic must contain letters or numbers.", "error");
+				return;
+			}
+
+			const hasConversation = ctx.sessionManager.getBranch().some((entry: any) =>
+				entry.type === "message" && (entry.message?.role === "user" || entry.message?.role === "assistant"),
+			);
+			if (hasConversation) {
+				const proceed = await ctx.ui.confirm(
+					"Current session already has history",
+					"The new lesson note will include the active conversation branch. Continue?",
+				);
+				if (!proceed) return;
+			}
+
+			const lessonDir = path.resolve(ctx.cwd, "lessons", topicId);
+			fs.mkdirSync(lessonDir, { recursive: true });
+			const date = localDate();
+			let lessonFile = path.join(lessonDir, `${date}-${subtopicId}.md`);
+			let suffix = 2;
+			while (fs.existsSync(lessonFile)) {
+				lessonFile = path.join(lessonDir, `${date}-${subtopicId}-${suffix}.md`);
+				suffix++;
+			}
+
+			const heading = topic.toLowerCase() === subtopic.toLowerCase()
+				? topic
+				: `${topic} — ${subtopic}`;
+			const initial = [
+				"---",
+				`topic: ${yamlString(topic)}`,
+				`topic-id: ${topicId}`,
+				`subtopic: ${yamlString(subtopic)}`,
+				`date: ${date}`,
+				"---",
+				"",
+				`# ${heading}`,
+				"",
+			].join("\n");
+			fs.writeFileSync(lessonFile, initial, { encoding: "utf-8", flag: "wx" });
+
+			const backfillResult = linkLogFile(lessonFile, ctx);
+			// backfill() intentionally rebuilds an existing md-log from session
+			// messages. For /learn, retain the structured lesson frontmatter/title
+			// in front of that reconstructed history.
+			if (backfillResult.wrote) {
+				const backfilled = fs.readFileSync(lessonFile, "utf-8");
+				fs.writeFileSync(lessonFile, `${initial.trimEnd()}\n\n${backfilled.trimStart()}`, "utf-8");
+			}
+			pi.setSessionName(`${topic}: ${subtopic}`);
+			const relative = path.relative(ctx.cwd, lessonFile).split(path.sep).join("/");
+			ctx.ui.notify(`Lesson linked: ${relative} (${backfillResult.messageCount} entries backfilled)`, "success");
+
+			pi.sendUserMessage(
+				[
+					"Start a teaching session using the `teach` skill.",
+					`Broad topic: ${topic}`,
+					`Tentative subtopic: ${subtopic}`,
+					`Lesson log: ${relative}`,
+					"First make my desired learning outcome concrete, then probe, present a plan for approval, teach, and curate the resulting topic note at the natural end.",
+				].join("\n"),
+			);
+		},
+	});
+
 	pi.registerCommand("md-log", {
 		description: "Mirror the session to a markdown file (backfills history)",
 		handler: async (args, ctx: any) => {
@@ -304,19 +441,20 @@ export default function mdLog(pi: ExtensionAPI) {
 				ctx.ui.notify(`Not a file: ${resolved}`, "error");
 				return;
 			}
+			const existing = fs.readFileSync(resolved, "utf-8");
+			if (existing.trim().length > 0) {
+				const replace = await ctx.ui.confirm(
+					"Replace existing note contents?",
+					"/md-log backfills by rebuilding the file from the active session branch. The selected file is not empty; continuing will replace its current contents.",
+				);
+				if (!replace) {
+					ctx.ui.notify("Link cancelled; the existing note was not changed.", "info");
+					return;
+				}
+			}
 
-			logFile = resolved;
-			pi.appendEntry("md-log", { file: resolved });
-
-			// Backfill the active branch.
-			const written = backfill(ctx);
-
-			const theme = ctx.ui.theme;
-			ctx.ui.setStatus(
-				"md-log",
-				theme.fg("accent", "🗒 ") + theme.fg("dim", path.basename(resolved)),
-			);
-			ctx.ui.notify(`Linked: ${resolved} (${written} entries backfilled)`, "success");
+			const result = linkLogFile(resolved, ctx);
+			ctx.ui.notify(`Linked: ${resolved} (${result.messageCount} entries backfilled)`, "success");
 		},
 	});
 
@@ -330,41 +468,20 @@ export default function mdLog(pi: ExtensionAPI) {
 			const name = path.basename(logFile);
 			logFile = null;
 			pi.appendEntry("md-log", { file: null });
-			ctx.ui.setStatus("md-log", undefined);
+			setLogStatus(ctx, null);
 			ctx.ui.notify(`Unlinked: ${name}`, "info");
 		},
 	});
 
 	// --- Backfill ---
 
-	function backfill(ctx: any): number {
-		if (!logFile) return 0;
-		const entries: any[] = ctx.sessionManager.getEntries();
-		if (entries.length === 0) return 0;
-
-		const byId = new Map<string, any>();
-		for (const e of entries) if (e.id) byId.set(e.id, e);
-
-		// Active leaf = last entry that has an id (skip the session header).
-		let leaf: any = null;
-		for (let i = entries.length - 1; i >= 0; i--) {
-			if (entries[i].id) {
-				leaf = entries[i];
-				break;
-			}
-		}
-		if (!leaf) return 0;
-
-		// Walk parent chain to root.
-		const chain: any[] = [];
-		let cur: any = leaf;
-		const seen = new Set<string>();
-		while (cur && cur.id && !seen.has(cur.id)) {
-			seen.add(cur.id);
-			chain.push(cur);
-			cur = cur.parentId ? byId.get(cur.parentId) : null;
-		}
-		chain.reverse();
+	function backfill(ctx: any): { messageCount: number; wrote: boolean } {
+		if (!logFile) return { messageCount: 0, wrote: false };
+		// getBranch() is already the ordered active root-to-leaf path. Using all
+		// entries here can accidentally restore an abandoned branch after /tree
+		// navigation or a fork.
+		const chain: any[] = ctx.sessionManager.getBranch();
+		if (chain.length === 0) return { messageCount: 0, wrote: false };
 
 		// Track tool-call args from assistant messages so we can pair with results.
 		const toolCallArgs = new Map<string, { name: string; args: any }>();
@@ -431,13 +548,15 @@ export default function mdLog(pi: ExtensionAPI) {
 			}
 		}
 
+		let wrote = false;
 		if (blocks.length > 0) {
 			try {
 				fs.writeFileSync(logFile, blocks.join("\n\n") + "\n", "utf-8");
+				wrote = true;
 			} catch {
 				// ignore
 			}
 		}
-		return count;
+		return { messageCount: count, wrote };
 	}
 }
